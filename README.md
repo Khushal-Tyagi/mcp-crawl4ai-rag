@@ -69,6 +69,21 @@ The server provides essential web crawling and search tools:
 7. **`check_ai_script_hallucinations`**: Analyze Python scripts for AI hallucinations by validating imports, method calls, and class usage against the knowledge graph
 8. **`query_knowledge_graph`**: Explore and query the Neo4j knowledge graph with commands like `repos`, `classes`, `methods`, and custom Cypher queries
 
+### Cross-Repository Code Context Tools
+
+These tools give the agent practical access to the context of *all* indexed
+code repositories — semantic snippets from any source file plus structural
+symbol lookups across the knowledge graph. They are designed to be combined
+so a single task can pull in relevant code from every repository the agent
+knows about.
+
+9. **`index_repository_source`**: Clone a GitHub repo and index its source files into Supabase (`source_id = repo:<name>`, `metadata.type = "repo_file"`) so they can be semantically searched. Complements `parse_github_repository`.
+10. **`list_indexed_repositories`**: List every repo the agent has context for, indicating whether it lives in the semantic store, the knowledge graph, or both.
+11. **`search_repository_code`**: Semantic search over indexed source files across all repos (or restricted to one via `repo_name`).
+12. **`get_repository_file`**: Reconstruct and return a previously indexed source file by `repo_name` + `path`.
+13. **`find_symbol_across_repos`** (requires `USE_KNOWLEDGE_GRAPH=true`): Find a class, method, or function by name across every repository in the knowledge graph.
+14. **`gather_task_context`**: Recommended entry point. Given a task description, returns a unified bundle of relevant code snippets and symbol matches drawn from every indexed repository.
+
 ## Prerequisites
 
 - [Docker/Docker Desktop](https://www.docker.com/products/docker-desktop/) if running the MCP server as a container (recommended)

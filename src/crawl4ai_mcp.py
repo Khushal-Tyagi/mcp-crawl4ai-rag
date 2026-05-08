@@ -22,6 +22,7 @@ import json
 import os
 import re
 import concurrent.futures
+import subprocess
 import sys
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
@@ -40,6 +41,16 @@ from utils import (
     update_source_info,
     extract_source_summary,
     search_code_examples
+)
+
+# Cross-repository "all codes' context" helpers
+from repo_context import (
+    index_repository_source_files,
+    list_indexed_repositories_async,
+    search_repository_code as _search_repository_code,
+    get_repository_file as _get_repository_file,
+    find_symbol_across_repos as _find_symbol_across_repos,
+    gather_task_context as _gather_task_context,
 )
 
 # Import knowledge graph modules
@@ -1747,6 +1758,307 @@ async def parse_github_repository(ctx: Context, repo_url: str) -> str:
             "repo_url": repo_url,
             "error": f"Repository parsing failed: {str(e)}"
         }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Cross-repository "all codes' context" tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def index_repository_source(
+    ctx: Context,
+    repo_url: str,
+    max_files: int = 0,
+    chunk_size: int = 4000,
+) -> str:
+    """
+    Index the source files of a GitHub repository into Supabase so the agent
+    can semantically retrieve their content alongside every other indexed
+    repository.
+
+    This complements ``parse_github_repository`` (which builds a Neo4j
+    structural graph). Running both gives the agent both *structural* and
+    *semantic* context for the repository.
+
+    Args:
+        ctx: The MCP server provided context.
+        repo_url: GitHub repository URL (e.g. ``https://github.com/user/repo.git``).
+        max_files: Maximum number of files to index (``0`` = no limit).
+        chunk_size: Approximate character size of each indexed code chunk.
+
+    Returns:
+        JSON string with indexing statistics.
+    """
+    try:
+        validation = validate_github_url(repo_url)
+        if not validation["valid"]:
+            return json.dumps({
+                "success": False,
+                "repo_url": repo_url,
+                "error": validation["error"],
+            }, indent=2)
+
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        if supabase_client is None:
+            return json.dumps({
+                "success": False,
+                "error": "Supabase client unavailable. Check SUPABASE_URL / SUPABASE_SERVICE_KEY.",
+            }, indent=2)
+
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(
+            None,
+            lambda: index_repository_source_files(
+                supabase_client,
+                repo_url,
+                max_files=max_files if max_files and max_files > 0 else None,
+                chunk_size=chunk_size,
+            ),
+        )
+
+        return json.dumps({
+            "success": True,
+            "repo_url": repo_url,
+            "statistics": stats,
+            "message": (
+                f"Indexed {stats['files_indexed']} files / {stats['chunks_indexed']} chunks "
+                f"from {stats['repo_name']}. Use search_repository_code or gather_task_context to query."
+            ),
+        }, indent=2)
+    except subprocess.CalledProcessError as e:
+        return json.dumps({
+            "success": False,
+            "repo_url": repo_url,
+            "error": f"git clone failed: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else str(e)}",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "repo_url": repo_url,
+            "error": f"Source indexing failed: {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def list_indexed_repositories(ctx: Context) -> str:
+    """
+    List every repository the agent currently has context for, combining the
+    semantic source-file store (Supabase) and the structural knowledge graph
+    (Neo4j). Each entry indicates which stores contain data for that repo.
+
+    Returns:
+        JSON string with a list of repositories and which backends they exist in.
+    """
+    try:
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        repo_extractor = ctx.request_context.lifespan_context.repo_extractor
+        neo4j_driver = repo_extractor.driver if repo_extractor else None
+
+        result = await list_indexed_repositories_async(supabase_client, neo4j_driver)
+        return json.dumps({"success": True, **result}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": f"Failed to list repositories: {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def search_repository_code(
+    ctx: Context,
+    query: str,
+    repo_name: str = None,
+    match_count: int = 10,
+) -> str:
+    """
+    Semantic search over indexed repository source files across *all*
+    repositories the agent has indexed (or restricted to one repo via
+    ``repo_name``).
+
+    Use this to pull relevant code snippets from any indexed repo for a
+    given task, question, or symbol description.
+
+    Args:
+        ctx: The MCP server provided context.
+        query: Free-text query (task description, symbol name, behaviour, etc.).
+        repo_name: Optional repo name to restrict the search.
+        match_count: Maximum number of snippets to return.
+
+    Returns:
+        JSON string with ranked code snippets (repo, path, language, similarity, content).
+    """
+    try:
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: _search_repository_code(
+                supabase_client, query, repo_name=repo_name, match_count=match_count
+            ),
+        )
+        return json.dumps({
+            "success": True,
+            "query": query,
+            "repo_name": repo_name,
+            "count": len(results),
+            "results": results,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "query": query,
+            "error": f"Search failed: {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def get_repository_file(ctx: Context, repo_name: str, path: str) -> str:
+    """
+    Reconstruct and return the full content of a previously indexed
+    repository source file.
+
+    Args:
+        ctx: The MCP server provided context.
+        repo_name: Name of the repository (matches what is shown by
+            ``list_indexed_repositories``).
+        path: File path relative to the repository root, e.g. ``src/main.py``.
+
+    Returns:
+        JSON string with the file's content and metadata, or an error if the
+        file is not present in the index.
+    """
+    try:
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: _get_repository_file(supabase_client, repo_name, path),
+        )
+        if not result.get("found"):
+            return json.dumps({
+                "success": False,
+                "repo_name": repo_name,
+                "path": path,
+                "error": result.get("error", "File not indexed."),
+            }, indent=2)
+        return json.dumps({"success": True, **result}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "repo_name": repo_name,
+            "path": path,
+            "error": f"Lookup failed: {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def find_symbol_across_repos(
+    ctx: Context,
+    name: str,
+    kind: str = None,
+    limit: int = 25,
+) -> str:
+    """
+    Find a class, method, or function by name across *every* repository in
+    the Neo4j knowledge graph.
+
+    Args:
+        ctx: The MCP server provided context.
+        name: Symbol name (case-insensitive substring match).
+        kind: Optional filter: ``class``, ``method``, or ``function``.
+            Defaults to all three.
+        limit: Maximum number of matches to return.
+
+    Returns:
+        JSON string listing matches with their owning repo, file, and
+        symbol metadata.
+    """
+    try:
+        knowledge_graph_enabled = os.getenv("USE_KNOWLEDGE_GRAPH", "false") == "true"
+        if not knowledge_graph_enabled:
+            return json.dumps({
+                "success": False,
+                "error": "Knowledge graph functionality is disabled. Set USE_KNOWLEDGE_GRAPH=true.",
+            }, indent=2)
+
+        repo_extractor = ctx.request_context.lifespan_context.repo_extractor
+        if not repo_extractor:
+            return json.dumps({
+                "success": False,
+                "error": "Knowledge graph driver unavailable. Check Neo4j configuration.",
+            }, indent=2)
+
+        results = await _find_symbol_across_repos(
+            repo_extractor.driver, name, kind=kind, limit=limit
+        )
+        return json.dumps({
+            "success": True,
+            "name": name,
+            "kind": kind,
+            "count": len(results),
+            "results": results,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "name": name,
+            "error": f"Symbol lookup failed: {format_neo4j_error(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def gather_task_context(
+    ctx: Context,
+    task: str,
+    repo_name: str = None,
+    max_snippets: int = 8,
+    max_symbols: int = 10,
+) -> str:
+    """
+    Assemble a unified, task-focused context bundle by combining semantic
+    snippets from indexed source files with symbol matches from the
+    knowledge graph — across *all* indexed repositories.
+
+    This is the recommended entry point when you want the agent to use the
+    full context of every indexed code repository for a given task. The
+    returned bundle includes:
+
+      * The list of repositories that contributed data
+      * Top semantic code snippets (with repo, path and similarity)
+      * Class / method / function matches inferred from identifier-like
+        terms in the task description
+
+    Args:
+        ctx: The MCP server provided context.
+        task: Free-text description of the task or question.
+        repo_name: Optional repo name to restrict the snippet search to one repo.
+        max_snippets: Maximum number of code snippets to include.
+        max_symbols: Maximum number of symbol matches to include.
+
+    Returns:
+        JSON string with the combined context bundle.
+    """
+    try:
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        repo_extractor = ctx.request_context.lifespan_context.repo_extractor
+        neo4j_driver = repo_extractor.driver if repo_extractor else None
+
+        bundle = await _gather_task_context(
+            supabase_client,
+            neo4j_driver,
+            task,
+            repo_name=repo_name,
+            max_snippets=max_snippets,
+            max_symbols=max_symbols,
+        )
+        return json.dumps({"success": True, **bundle}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "task": task,
+            "error": f"Failed to gather task context: {str(e)}",
+        }, indent=2)
+
 
 async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """
