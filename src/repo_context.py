@@ -613,7 +613,7 @@ async def gather_task_context(
 
     symbols: List[Dict[str, Any]] = []
     if neo4j_driver is not None and candidate_terms:
-        seen: set = set()
+        seen: set[tuple] = set()
         per_term = max(2, max_symbols // max(1, len(candidate_terms)))
         for term in candidate_terms:
             try:
