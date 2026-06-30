@@ -1,0 +1,82 @@
+---
+applyTo: "**"
+---
+
+# MCP Context Rules
+
+## NEVER clone repositories locally just to read/understand code
+- Do NOT run `git clone` on the local machine just to gather context or understand a codebase
+- Do NOT clone a repo locally just to read its files for code generation tasks
+
+## ALWAYS use MCP tools for repository context
+When you need to read or understand code from an already-indexed repository:
+- Use `search_repository_code` to find relevant code snippets
+- Use `get_repository_file` to retrieve specific files
+- Use `gather_task_context` to get broad context for a task
+- Use `find_symbol_across_repos` to locate classes/functions/methods
+
+## Code generation workflow
+1. Use MCP tools to retrieve context from the server (indexed repos)
+2. Generate the requested code (tests, utilities, etc.) based on that context
+3. Write ONLY the generated output files locally
+4. Never bring the source repos themselves to the local machine
+
+## Example: generating tests
+- BAD: `git clone https://github.com/org/repo` then read files locally
+- GOOD: call `gather_task_context("generate sanity tests for X")` → use returned snippets → write test file locally
+
+---
+
+## Indexing Files From Different Locations
+
+### Scenario 1 — File is on THIS machine (where Cursor is running)
+When user says "index this file/folder from my machine / local machine / this laptop":
+1. Call `prepare_cursor_machine_upload(source_name="chosen-name")` to get the SCP command and staging path
+2. Show the returned `scp_command` to the user with LOCAL_PATH replaced by their actual path
+3. Run the `scp_command` in the LOCAL terminal (this sends files to the server)
+4. Call `index_local_path(local_path=<staging_path>, source_name="chosen-name")`
+
+### Scenario 2 — File is on a REMOTE system (not this machine, not the server)
+When user says "index files from server X / machine at IP / another system":
+- If credentials already saved: `index_remote_path(remote_path="...", source_name="...", system_name="saved-name")`
+- If new system with inline creds: `index_remote_path(remote_path="...", source_name="...", host="IP", user="user", ssh_key="/root/.ssh/id_rsa", save_credentials=true, system_name="new-name")`
+  - `save_credentials=true` saves them to remote_systems.json on the server for future use
+- The server SSHes into the remote machine, SCPs the files, indexes them
+
+### Scenario 3 — File is already on the SERVER
+`index_local_path(local_path="/absolute/path/on/server", source_name="chosen-name")`
+
+---
+
+## Python Package → Indexed Repo Mapping
+
+When you see a Python import, map it to the correct indexed repo name using this table.
+Always pass the `repo_name` filter when searching to avoid noise from other repos.
+
+| Python import prefix | Indexed repo name |
+|---|---|
+| `sundancemesa` / `sundancemesa.*` | `frameworks.validation.pythonsv.projects.sundancemesa` |
+| `common_utils` / `common_utils.*` | `applications.validation.fpga.solutions.utilities.utilities` |
+
+### Usage rule
+When the user references or imports anything from `sundancemesa`:
+1. Use `search_repository_code(query="...", repo_name="frameworks.validation.pythonsv.projects.sundancemesa")`
+2. Use `get_repository_file(repo_name="frameworks.validation.pythonsv.projects.sundancemesa", path="...")`
+3. Do NOT search all repos — always scope to the mapped repo name above
+
+When the user references or imports anything from `common_utils`:
+1. Use `search_repository_code(query="...", repo_name="applications.validation.fpga.solutions.utilities.utilities")`
+2. Use `get_repository_file(repo_name="applications.validation.fpga.solutions.utilities.utilities", path="...")`
+3. Do NOT search all repos — always scope to the mapped repo name above
+
+### Example
+```python
+from sundancemesa.network.eth.eth_vsip_frame_buf import VSIPFrameBuffer
+```
+→ search `repo_name="frameworks.validation.pythonsv.projects.sundancemesa"` for `VSIPFrameBuffer` or `eth_vsip_frame_buf`
+
+```python
+from common_utils import some_helper
+import common_utils
+```
+→ search `repo_name="applications.validation.fpga.solutions.utilities.utilities"` for `some_helper` or relevant symbol

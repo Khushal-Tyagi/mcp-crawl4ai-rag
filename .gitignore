@@ -1,4 +1,5 @@
 .env
+remote_systems.json
 .venv
 __pycache__
 crawl4ai_mcp.egg-info

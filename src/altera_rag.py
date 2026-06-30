@@ -40,12 +40,15 @@ from utils import (
     add_code_examples_to_supabase,
     update_source_info,
     extract_source_summary,
-    search_code_examples
+    search_code_examples,
+    delete_source,
 )
 
 # Cross-repository "all codes' context" helpers
 from repo_context import (
     index_repository_source_files,
+    index_local_directory,
+    index_remote_path as _index_remote_path,
     list_indexed_repositories_async,
     search_repository_code as _search_repository_code,
     get_repository_file as _get_repository_file,
@@ -227,8 +230,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
 
 # Initialize FastMCP server
 mcp = FastMCP(
-    "mcp-crawl4ai-rag",
-    description="MCP server for RAG and web crawling with Crawl4AI",
+    "altera-rag",
     lifespan=crawl4ai_lifespan,
     host=os.getenv("HOST", "0.0.0.0"),
     port=os.getenv("PORT", "8051")
@@ -1770,6 +1772,8 @@ async def index_repository_source(
     repo_url: str,
     max_files: int = 0,
     chunk_size: int = 4000,
+    force_reindex: bool = False,
+    skip_existing: bool = False,
 ) -> str:
     """
     Index the source files of a GitHub repository into Supabase so the agent
@@ -1785,6 +1789,8 @@ async def index_repository_source(
         repo_url: GitHub repository URL (e.g. ``https://github.com/user/repo.git``).
         max_files: Maximum number of files to index (``0`` = no limit).
         chunk_size: Approximate character size of each indexed code chunk.
+        force_reindex: If True, delete all existing data for this repo before re-indexing.
+        skip_existing: If True, skip files already indexed — only index new/previously skipped files.
 
     Returns:
         JSON string with indexing statistics.
@@ -1805,6 +1811,15 @@ async def index_repository_source(
                 "error": "Supabase client unavailable. Check SUPABASE_URL / SUPABASE_SERVICE_KEY.",
             }, indent=2)
 
+        # Delete existing data for this repo before re-indexing if requested
+        deleted = None
+        if force_reindex:
+            # Derive the source_id the same way repo_context does: owner/repo from URL
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(repo_url.rstrip('/'))
+            _source_id = _parsed.path.lstrip('/').removesuffix('.git')
+            deleted = delete_source(supabase_client, _source_id)
+
         loop = asyncio.get_event_loop()
         stats = await loop.run_in_executor(
             None,
@@ -1816,7 +1831,7 @@ async def index_repository_source(
             ),
         )
 
-        return json.dumps({
+        result = {
             "success": True,
             "repo_url": repo_url,
             "statistics": stats,
@@ -1824,7 +1839,10 @@ async def index_repository_source(
                 f"Indexed {stats['files_indexed']} files / {stats['chunks_indexed']} chunks "
                 f"from {stats['repo_name']}. Use search_repository_code or gather_task_context to query."
             ),
-        }, indent=2)
+        }
+        if deleted is not None:
+            result["deleted_before_reindex"] = deleted
+        return json.dumps(result, indent=2)
     except subprocess.CalledProcessError as e:
         return json.dumps({
             "success": False,
@@ -1861,6 +1879,374 @@ async def list_indexed_repositories(ctx: Context) -> str:
             "success": False,
             "error": f"Failed to list repositories: {str(e)}",
         }, indent=2)
+
+
+@mcp.tool()
+async def update_repository(
+    ctx: Context,
+    repo_name: str,
+    max_files: int = 0,
+    chunk_size: int = 4000,
+) -> str:
+    """
+    Re-index a previously indexed repository by name, without needing the original URL.
+
+    Looks up the stored repo URL from the sources table, deletes all existing
+    indexed data for the repo, then re-indexes it fresh from the latest commit.
+
+    Use ``list_indexed_repositories`` first to see available repo names.
+
+    Args:
+        ctx: The MCP server provided context.
+        repo_name: Short name of the repo (e.g. ``my-repo`` or ``org/my-repo``).
+                   Matches against the end of the stored source_id (``repo:<name>``).
+        max_files: Maximum number of files to index (``0`` = no limit).
+        chunk_size: Approximate character size of each indexed code chunk.
+
+    Returns:
+        JSON string with indexing statistics.
+    """
+    try:
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        if supabase_client is None:
+            return json.dumps({
+                "success": False,
+                "error": "Supabase client unavailable. Check SUPABASE_URL / SUPABASE_SERVICE_KEY.",
+            }, indent=2)
+
+        # Normalise: strip leading "repo:" if user passed it
+        clean_name = repo_name.removeprefix("repo:")
+
+        # Look up the source record to find the stored repo_url
+        res = supabase_client.table("sources").select("source_id,metadata").like(
+            "source_id", f"%{clean_name}"
+        ).execute()
+
+        if not res.data:
+            return json.dumps({
+                "success": False,
+                "repo_name": repo_name,
+                "error": (
+                    f"No indexed repository matching '{repo_name}' found. "
+                    "Use list_indexed_repositories to see available repos."
+                ),
+            }, indent=2)
+
+        if len(res.data) > 1:
+            matches = [r["source_id"] for r in res.data]
+            return json.dumps({
+                "success": False,
+                "repo_name": repo_name,
+                "error": f"Ambiguous name — matched multiple repos: {matches}. Use a more specific name.",
+            }, indent=2)
+
+        row = res.data[0]
+        src_id = row["source_id"]
+        metadata = row.get("metadata") or {}
+        repo_url = metadata.get("repo_url")
+
+        if not repo_url:
+            return json.dumps({
+                "success": False,
+                "repo_name": repo_name,
+                "source_id": src_id,
+                "error": (
+                    "Original repo URL not stored for this repository (indexed before this feature was added). "
+                    "Please re-index using index_repository_source with the full URL and force_reindex=true."
+                ),
+            }, indent=2)
+
+        # Delete existing data then re-index
+        deleted = delete_source(supabase_client, src_id)
+
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(
+            None,
+            lambda: index_repository_source_files(
+                supabase_client,
+                repo_url,
+                max_files=max_files if max_files and max_files > 0 else None,
+                chunk_size=chunk_size,
+            ),
+        )
+
+        return json.dumps({
+            "success": True,
+            "repo_name": repo_name,
+            "repo_url": repo_url,
+            "deleted_before_reindex": deleted,
+            "statistics": stats,
+            "message": (
+                f"Updated {stats['files_indexed']} files / {stats['chunks_indexed']} chunks "
+                f"from {stats['repo_name']}."
+            ),
+        }, indent=2)
+
+    except subprocess.CalledProcessError as e:
+        return json.dumps({
+            "success": False,
+            "repo_name": repo_name,
+            "error": f"git clone failed: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else str(e)}",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "repo_name": repo_name,
+            "error": f"Update failed: {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def index_local_path(
+    ctx: Context,
+    local_path: str,
+    source_name: str,
+    max_files: int = 0,
+    chunk_size: int = 4000,
+    force_reindex: bool = False,
+    skip_existing: bool = False,
+) -> str:
+    """
+    Index files from a local directory or single file on the server into Supabase.
+
+    Use this to index hardware spec files (.rdl, .csv, .txt), address maps,
+    datasheets, or any files that have been SCP'd onto the server.
+
+    The files are indexed under source_id ``local:<source_name>`` and are
+    searchable via ``search_repository_code`` using ``repo_name=<source_name>``.
+
+    Args:
+        ctx: The MCP server provided context.
+        local_path: Absolute path to the directory or file on the **server**
+                    (e.g. ``/home/user/specs/chip_registers``).
+        source_name: Logical name to group these files under
+                     (e.g. ``vsip-registers``, ``address-maps``).
+        max_files: Maximum number of files to index (``0`` = no limit).
+        chunk_size: Approximate character size of each indexed chunk.
+        force_reindex: If True, delete existing data for this source_name before re-indexing.
+        skip_existing: If True, skip files already indexed — only index new/previously skipped files.
+
+    Returns:
+        JSON string with indexing statistics.
+    """
+    try:
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        if supabase_client is None:
+            return json.dumps({
+                "success": False,
+                "error": "Supabase client unavailable. Check SUPABASE_URL / SUPABASE_SERVICE_KEY.",
+            }, indent=2)
+
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(
+            None,
+            lambda: index_local_directory(
+                supabase_client,
+                local_path,
+                source_name,
+                chunk_size=chunk_size,
+                max_files=max_files if max_files and max_files > 0 else None,
+                force_reindex=force_reindex,
+                skip_existing=skip_existing,
+            ),
+        )
+
+        skipped_msg = f" ({stats.get('files_skipped_existing', 0)} already-indexed files skipped)" if skip_existing else ""
+        return json.dumps({
+            "success": True,
+            "source_name": source_name,
+            "local_path": local_path,
+            "statistics": stats,
+            "message": (
+                f"Indexed {stats['files_indexed']} files / {stats['chunks_indexed']} chunks "
+                f"from '{local_path}' as '{source_name}'.{skipped_msg} "
+                f"Query with search_repository_code(repo_name='{source_name}')."
+            ),
+        }, indent=2)
+
+    except FileNotFoundError as e:
+        return json.dumps({
+            "success": False,
+            "local_path": local_path,
+            "error": str(e),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "local_path": local_path,
+            "error": f"Local indexing failed: {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def prepare_cursor_machine_upload(
+    ctx: Context,
+    source_name: str,
+) -> str:
+    """
+    **Scenario 1 — File is on the Cursor machine (your Windows/Linux laptop).**
+
+    Creates a staging directory on the server and returns the exact SCP command
+    to run on your local machine to push files to the server.
+
+    Workflow:
+    1. Call this tool to get the SCP command and staging path.
+    2. Run the returned ``scp_command`` in your local terminal (replacing LOCAL_PATH).
+    3. Call ``index_local_path`` with the returned ``staging_path`` and same ``source_name``.
+
+    Server SSH connection info is read from the .env file:
+    ``SERVER_SSH_HOST``, ``SERVER_SSH_USER``, ``SERVER_SSH_PORT``.
+    Use ``SERVER_SSH_KEY`` for key-based auth or ``SERVER_SSH_PASSWORD`` for password-based auth.
+
+    Args:
+        ctx: The MCP server provided context.
+        source_name: Logical name for this data source (e.g. ``"vsip-registers"``).
+
+    Returns:
+        JSON with ``scp_command`` to run locally and ``staging_path`` to index from.
+    """
+    import uuid as _uuid
+    ssh_host     = os.getenv("SERVER_SSH_HOST", "")
+    ssh_user     = os.getenv("SERVER_SSH_USER", "")
+    ssh_port     = os.getenv("SERVER_SSH_PORT", "22")
+    ssh_key      = os.getenv("SERVER_SSH_KEY", "")
+    ssh_password = os.getenv("SERVER_SSH_PASSWORD", "")
+
+    if not ssh_host or not ssh_user:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "SERVER_SSH_HOST and SERVER_SSH_USER must be set in .env on the server."
+            ),
+        }, indent=2)
+
+    staging_path = f"/tmp/mcp-upload-{source_name}-{_uuid.uuid4().hex[:8]}"
+    os.makedirs(staging_path, exist_ok=True)
+
+    key_part = f"-i {ssh_key} " if ssh_key else ""
+    base_scp = f'scp -r -P {ssh_port} {key_part}"LOCAL_PATH" {ssh_user}@{ssh_host}:{staging_path}/'
+
+    if ssh_password:
+        # sshpass works on Linux/macOS; on Windows use Git Bash or WSL
+        scp_command = f'sshpass -p "{ssh_password}" {base_scp}'
+        auth_method = "password (via sshpass)"
+        windows_note = (
+            "On Windows: install sshpass via Git Bash/WSL, "
+            "or just run the scp command without sshpass and type the password when prompted."
+        )
+    else:
+        scp_command = base_scp
+        auth_method = "ssh key" if ssh_key else "default ssh agent"
+        windows_note = None
+
+    result = {
+        "success": True,
+        "staging_path": staging_path,
+        "scp_command": scp_command,
+        "auth_method": auth_method,
+        "instructions": [
+            "1. Replace LOCAL_PATH in the scp_command with your actual local path.",
+            "2. Run the scp_command in your LOCAL terminal (not on the server).",
+            f"3. Then call index_local_path with local_path='{staging_path}' and source_name='{source_name}'.",
+        ],
+    }
+    if windows_note:
+        result["windows_note"] = windows_note
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def index_remote_path(
+    ctx: Context,
+    remote_path: str,
+    source_name: str,
+    system_name: str = None,
+    host: str = None,
+    user: str = "root",
+    ssh_key: str = None,
+    password: str = None,
+    port: int = 22,
+    save_credentials: bool = False,
+    max_files: int = 0,
+    chunk_size: int = 4000,
+    force_reindex: bool = False,
+) -> str:
+    """
+    **Scenario 2 — File is on a remote system (not your Cursor machine).**
+
+    SCPs files from a remote machine to the server and indexes them into Supabase.
+
+    Credentials can be provided in two ways:
+    - **From saved config**: pass ``system_name`` (must exist in remote_systems.json on server).
+    - **Inline**: pass ``host``, ``user``, and either ``password`` or ``ssh_key``.
+      Set ``save_credentials=true`` to save them to remote_systems.json for future use.
+
+    Args:
+        ctx: The MCP server provided context.
+        remote_path: Path to the file or directory on the remote machine.
+        source_name: Logical name to index these files under (e.g. ``"chip-specs"``).
+        system_name: Key in remote_systems.json (if credentials already saved).
+        host: Remote machine IP or hostname (if not using system_name).
+        user: SSH username on the remote machine. Default ``"root"``.
+        ssh_key: Path to SSH private key ON THE SERVER to authenticate to the remote.
+        password: SSH password for the remote machine (alternative to ssh_key).
+        port: SSH port on the remote machine. Default ``22``.
+        save_credentials: If True, save credentials under system_name in remote_systems.json.
+        max_files: Maximum files to index (``0`` = no limit).
+        chunk_size: Approximate character size per chunk.
+        force_reindex: If True, delete existing data for source_name before re-indexing.
+
+    Returns:
+        JSON string with indexing statistics.
+    """
+    try:
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        if supabase_client is None:
+            return json.dumps({"success": False, "error": "Supabase client unavailable."}, indent=2)
+
+        config_path = os.getenv("REMOTE_SYSTEMS_CONFIG", "/app/remote_systems.json")
+
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(
+            None,
+            lambda: _index_remote_path(
+                supabase_client,
+                remote_path=remote_path,
+                source_name=source_name,
+                config_path=config_path,
+                system_name=system_name,
+                host=host,
+                user=user,
+                ssh_key=ssh_key,
+                password=password,
+                port=port,
+                save_credentials=save_credentials,
+                chunk_size=chunk_size,
+                max_files=max_files if max_files and max_files > 0 else None,
+                force_reindex=force_reindex,
+            ),
+        )
+
+        saved_msg = f" Credentials saved as '{system_name}'." if save_credentials and system_name else ""
+        return json.dumps({
+            "success": True,
+            "system_name": system_name or host,
+            "remote_path": remote_path,
+            "source_name": source_name,
+            "statistics": stats,
+            "message": (
+                f"Indexed {stats['files_indexed']} files / {stats['chunks_indexed']} chunks "
+                f"from '{system_name or host}:{remote_path}' as '{source_name}'.{saved_msg} "
+                f"Query with search_repository_code(repo_name='{source_name}')."
+            ),
+        }, indent=2)
+
+    except ValueError as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+    except RuntimeError as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Remote indexing failed: {str(e)}"}, indent=2)
 
 
 @mcp.tool()
@@ -2158,6 +2544,8 @@ async def main():
     if transport == 'sse':
         # Run the MCP server with sse transport
         await mcp.run_sse_async()
+    elif transport == 'streamable-http':
+        await mcp.run_streamable_http_async()
     else:
         # Run the MCP server with stdio transport
         await mcp.run_stdio_async()

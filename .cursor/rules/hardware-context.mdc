@@ -1,0 +1,66 @@
+---
+applyTo: "**"
+---
+
+# Hardware Architecture Context
+
+## Target Hardware Platform
+<!-- Fill in your chip/platform name -->
+<!-- Example: Intel FPGA Agilex, custom ASIC, etc. -->
+
+Platform: <!-- e.g. Custom VSIP-based FPGA platform -->
+
+---
+
+## VSIP Architecture
+<!-- Add key facts about your VSIP hardware here. Examples below: -->
+
+<!--
+- VSIP frame buffer width: X bytes
+- DMA channel count: N
+- Register base address: 0xXXXXXXXX
+- Interrupt lines: IRQ0 = ..., IRQ1 = ...
+- Clock domains: core_clk = X MHz, eth_clk = Y MHz
+-->
+
+---
+
+## Memory Map
+<!-- Example:
+| Region | Base Address | Size | Description |
+|---|---|---|---|
+| VSIP registers | 0x00000000 | 4KB | Control/status registers |
+| Frame buffer | 0x10000000 | 256MB | DMA-accessible frame memory |
+-->
+
+---
+
+## Coding Constraints for This Hardware
+
+<!-- Add rules the agent must follow when generating code for this hardware. Examples:
+- All register accesses must be 32-bit aligned
+- DMA transfers must be cache-line aligned (64 bytes)
+- Never use Python threading — use asyncio only
+- Frame buffer addresses are physical, not virtual
+- Always call flush_cache() after writing to shared memory
+-->
+
+---
+
+## Key Classes / APIs for Hardware Access
+
+<!-- Map hardware concepts to code. Examples:
+- To access VSIP frame buffer → use `VSIPFrameBuffer` from `sundancemesa.network.eth.eth_vsip_frame_buf`
+- To configure Ethernet → use `EthConfig` from `sundancemesa.network.eth`
+- For register read/write → use `common_utils.reg_read()` / `common_utils.reg_write()`
+-->
+
+---
+
+## Hardware-Specific Code Generation Rules
+
+When generating code that interacts with hardware:
+1. Always retrieve relevant hardware API context first using `search_repository_code`
+2. Respect the memory map and alignment constraints above
+3. Use the exact class/function names from the indexed repos — do not invent new API names
+4. Add comments referencing register names or spec section numbers where relevant

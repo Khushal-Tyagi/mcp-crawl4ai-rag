@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy this to remote_systems.json and fill in your details.",
+  "_comment2": "Use either ssh_key (path on server) or password. Leave unused one as empty string.",
+
+  "lab-server-ssh": {
+    "host": "10.0.0.50",
+    "user": "sysadmin",
+    "ssh_key": "/root/.ssh/id_rsa",
+    "password": "",
+    "port": 22
+  },
+
+  "lab-server-password": {
+    "host": "10.0.0.51",
+    "user": "sysadmin",
+    "ssh_key": "",
+    "password": "your-password-here",
+    "port": 22
+  }
+}

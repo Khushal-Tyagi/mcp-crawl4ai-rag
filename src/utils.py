@@ -7,12 +7,24 @@ from typing import List, Dict, Any, Optional, Tuple
 import json
 from supabase import create_client, Client
 from urllib.parse import urlparse
-import openai
+from openai import OpenAI
 import re
 import time
 
-# Load OpenAI API key for embeddings
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Embedding client — points to Ollama by default, override with env vars
+_embedding_client = OpenAI(
+    base_url=os.getenv("EMBEDDING_BASE_URL", "http://localhost:11434/v1"),
+    api_key=os.getenv("OPENAI_API_KEY", "ollama"),
+)
+
+# LLM client — for summaries/contextual embeddings
+_llm_client = OpenAI(
+    base_url=os.getenv("LLM_BASE_URL", os.getenv("EMBEDDING_BASE_URL", "http://localhost:11434/v1")),
+    api_key=os.getenv("OPENAI_API_KEY", "ollama"),
+)
+
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "mxbai-embed-large")
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))  # mxbai-embed-large = 1024
 
 def get_supabase_client() -> Client:
     """
@@ -41,14 +53,20 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
     if not texts:
         return []
-    
+
+    # Safety net: truncate any text that exceeds the model's context window
+    # mxbai-embed-large has ~512 token limit (~1800 chars). Normal chunks should
+    # already be <=1500 chars, but single long lines could still exceed the limit.
+    max_chars = int(os.getenv("EMBEDDING_MAX_CHARS", "1800"))
+    texts = [t[:max_chars] if len(t) > max_chars else t for t in texts]
+
     max_retries = 3
     retry_delay = 1.0  # Start with 1 second delay
     
     for retry in range(max_retries):
         try:
-            response = openai.embeddings.create(
-                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
+            response = _embedding_client.embeddings.create(
+                model=EMBEDDING_MODEL,
                 input=texts
             )
             return [item.embedding for item in response.data]
@@ -67,16 +85,16 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                 
                 for i, text in enumerate(texts):
                     try:
-                        individual_response = openai.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=[text]
+                        individual_response = _embedding_client.embeddings.create(
+                            model=EMBEDDING_MODEL,
+                            input=[text[:max_chars] if len(text) > max_chars else text]
                         )
                         embeddings.append(individual_response.data[0].embedding)
                         successful_count += 1
                     except Exception as individual_error:
                         print(f"Failed to create embedding for text {i}: {individual_error}")
                         # Add zero embedding as fallback
-                        embeddings.append([0.0] * 1536)
+                        embeddings.append([0.0] * EMBEDDING_DIMENSIONS)
                 
                 print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
                 return embeddings
@@ -93,11 +111,11 @@ def create_embedding(text: str) -> List[float]:
     """
     try:
         embeddings = create_embeddings_batch([text])
-        return embeddings[0] if embeddings else [0.0] * 1536
+        return embeddings[0] if embeddings else [0.0] * EMBEDDING_DIMENSIONS
     except Exception as e:
         print(f"Error creating embedding: {e}")
         # Return empty embedding if there's an error
-        return [0.0] * 1536
+        return [0.0] * EMBEDDING_DIMENSIONS
 
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
@@ -125,8 +143,8 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
+        # Call the LLM to generate contextual information
+        response = _llm_client.chat.completions.create(
             model=model_choice,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
@@ -207,34 +225,36 @@ def add_documents_to_supabase(
     # Check if MODEL_CHOICE is set for contextual embeddings
     use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
     print(f"\n\nUse contextual embeddings: {use_contextual_embeddings}\n\n")
-    
-    # Process in batches to avoid memory issues
-    for i in range(0, len(contents), batch_size):
-        batch_end = min(i + batch_size, len(contents))
-        
-        # Get batch slices
-        batch_urls = urls[i:batch_end]
-        batch_chunk_numbers = chunk_numbers[i:batch_end]
-        batch_contents = contents[i:batch_end]
-        batch_metadatas = metadatas[i:batch_end]
-        
-        # Apply contextual embedding to each chunk if MODEL_CHOICE is set
+
+    # Split all contents into batches upfront
+    total_chunks = len(contents)
+    total_batches = (total_chunks + batch_size - 1) // batch_size
+    print(f"[utils] Embedding and storing {total_chunks} chunks in {total_batches} batches...")
+
+    batches = []
+    for i in range(0, total_chunks, batch_size):
+        batch_end = min(i + batch_size, total_chunks)
+        batches.append((
+            urls[i:batch_end],
+            chunk_numbers[i:batch_end],
+            contents[i:batch_end],
+            metadatas[i:batch_end],
+        ))
+
+    completed = [0]
+
+    def process_batch(args):
+        batch_num, batch_urls, batch_chunk_numbers, batch_contents, batch_metadatas = args
+
         if use_contextual_embeddings:
-            # Prepare arguments for parallel processing
-            process_args = []
-            for j, content in enumerate(batch_contents):
-                url = batch_urls[j]
-                full_document = url_to_full_document.get(url, "")
-                process_args.append((url, content, full_document))
-            
-            # Process in parallel using ThreadPoolExecutor
+            process_args = [
+                (batch_urls[j], batch_contents[j], url_to_full_document.get(batch_urls[j], ""))
+                for j in range(len(batch_contents))
+            ]
             contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                # Submit all tasks and collect results
-                future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
-                                for idx, arg in enumerate(process_args)}
-                
-                # Process results as they complete
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+                future_to_idx = {ex.submit(process_chunk_with_context, arg): idx
+                                 for idx, arg in enumerate(process_args)}
                 for future in concurrent.futures.as_completed(future_to_idx):
                     idx = future_to_idx[future]
                     try:
@@ -243,66 +263,46 @@ def add_documents_to_supabase(
                         if success:
                             batch_metadatas[idx]["contextual_embedding"] = True
                     except Exception as e:
-                        print(f"Error processing chunk {idx}: {e}")
-                        # Use original content as fallback
                         contextual_contents.append(batch_contents[idx])
-            
-            # Sort results back into original order if needed
             if len(contextual_contents) != len(batch_contents):
-                print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
-                # Use original contents as fallback
                 contextual_contents = batch_contents
         else:
-            # If not using contextual embeddings, use original contents
             contextual_contents = batch_contents
-        
-        # Create embeddings for the entire batch at once
+
         batch_embeddings = create_embeddings_batch(contextual_contents)
-        
+
         batch_data = []
         for j in range(len(contextual_contents)):
-            # Extract metadata fields
-            chunk_size = len(contextual_contents[j])
-            
-            # Extract source_id from URL
-            parsed_url = urlparse(batch_urls[j])
-            source_id = parsed_url.netloc or parsed_url.path
-            
-            # Prepare data for insertion
-            data = {
+            chunk_size_val = len(contextual_contents[j])
+            meta_source = batch_metadatas[j].get("source") or batch_metadatas[j].get("source_id")
+            if meta_source:
+                source_id = meta_source
+            else:
+                parsed_url = urlparse(batch_urls[j])
+                source_id = parsed_url.netloc or parsed_url.path
+
+            batch_data.append({
                 "url": batch_urls[j],
                 "chunk_number": batch_chunk_numbers[j],
-                "content": contextual_contents[j],  # Store original content
-                "metadata": {
-                    "chunk_size": chunk_size,
-                    **batch_metadatas[j]
-                },
-                "source_id": source_id,  # Add source_id field
-                "embedding": batch_embeddings[j]  # Use embedding from contextual content
-            }
-            
-            batch_data.append(data)
-        
-        # Insert batch into Supabase with retry logic
+                "content": contextual_contents[j],
+                "metadata": {"chunk_size": chunk_size_val, **batch_metadatas[j]},
+                "source_id": source_id,
+                "embedding": batch_embeddings[j],
+            })
+
         max_retries = 3
-        retry_delay = 1.0  # Start with 1 second delay
-        
+        retry_delay = 1.0
         for retry in range(max_retries):
             try:
                 client.table("crawled_pages").insert(batch_data).execute()
-                # Success - break out of retry loop
                 break
             except Exception as e:
                 if retry < max_retries - 1:
-                    print(f"Error inserting batch into Supabase (attempt {retry + 1}/{max_retries}): {e}")
-                    print(f"Retrying in {retry_delay} seconds...")
+                    print(f"Error inserting batch {batch_num} (attempt {retry + 1}/{max_retries}): {e}")
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                 else:
-                    # Final attempt failed
-                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
-                    # Optionally, try inserting records one by one as a last resort
-                    print("Attempting to insert records individually...")
+                    print(f"Failed to insert batch {batch_num} after {max_retries} attempts: {e}")
                     successful_inserts = 0
                     for record in batch_data:
                         try:
@@ -310,9 +310,18 @@ def add_documents_to_supabase(
                             successful_inserts += 1
                         except Exception as individual_error:
                             print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
-                    
                     if successful_inserts > 0:
                         print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+
+        completed[0] += 1
+        if completed[0] % 10 == 0 or completed[0] == total_batches:
+            print(f"[utils] Batch {completed[0]}/{total_batches} ({int(completed[0]/total_batches*100)}%) done")
+
+    parallel_batches = int(os.getenv("EMBEDDING_PARALLEL_BATCHES", "4"))
+    batch_args = [(i + 1, b[0], b[1], b[2], b[3]) for i, b in enumerate(batches)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_batches) as executor:
+        list(executor.map(lambda a: process_batch(a), batch_args))
 
 def search_documents(
     client: Client, 
@@ -468,7 +477,7 @@ Based on the code example and its surrounding context, provide a concise summary
 """
     
     try:
-        response = openai.chat.completions.create(
+        response = _llm_client.chat.completions.create(
             model=model_choice,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
@@ -594,7 +603,7 @@ def add_code_examples_to_supabase(
         print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
 
 
-def update_source_info(client: Client, source_id: str, summary: str, word_count: int):
+def update_source_info(client: Client, source_id: str, summary: str, word_count: int, metadata: dict = None):
     """
     Update or insert source information in the sources table.
     
@@ -603,28 +612,69 @@ def update_source_info(client: Client, source_id: str, summary: str, word_count:
         source_id: The source ID (domain)
         summary: Summary of the source
         word_count: Total word count for the source
+        metadata: Optional extra metadata to store (e.g. {"repo_url": "..."})
     """
     try:
-        # Try to update existing source
-        result = client.table('sources').update({
+        update_data = {
             'summary': summary,
             'total_word_count': word_count,
             'updated_at': 'now()'
-        }).eq('source_id', source_id).execute()
+        }
+        if metadata:
+            update_data['metadata'] = metadata
+
+        # Try to update existing source
+        result = client.table('sources').update(update_data).eq('source_id', source_id).execute()
         
         # If no rows were updated, insert new source
         if not result.data:
-            client.table('sources').insert({
+            insert_data = {
                 'source_id': source_id,
                 'summary': summary,
-                'total_word_count': word_count
-            }).execute()
+                'total_word_count': word_count,
+                'metadata': metadata or {},
+            }
+            client.table('sources').insert(insert_data).execute()
             print(f"Created new source: {source_id}")
         else:
             print(f"Updated source: {source_id}")
             
     except Exception as e:
         print(f"Error updating source {source_id}: {e}")
+
+
+def delete_source(client: Client, source_id: str) -> dict:
+    """
+    Delete all data for a source (crawled pages, code examples, and the source record itself).
+
+    Args:
+        client: Supabase client
+        source_id: The source ID to delete
+
+    Returns:
+        dict with counts of deleted rows per table
+    """
+    counts = {}
+    try:
+        r = client.table('code_examples').delete().eq('source_id', source_id).execute()
+        counts['code_examples'] = len(r.data) if r.data else 0
+    except Exception as e:
+        counts['code_examples_error'] = str(e)
+
+    try:
+        r = client.table('crawled_pages').delete().eq('source_id', source_id).execute()
+        counts['crawled_pages'] = len(r.data) if r.data else 0
+    except Exception as e:
+        counts['crawled_pages_error'] = str(e)
+
+    try:
+        r = client.table('sources').delete().eq('source_id', source_id).execute()
+        counts['sources'] = len(r.data) if r.data else 0
+    except Exception as e:
+        counts['sources_error'] = str(e)
+
+    print(f"Deleted source '{source_id}': {counts}")
+    return counts
 
 
 def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
@@ -662,8 +712,8 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 """
     
     try:
-        # Call the OpenAI API to generate the summary
-        response = openai.chat.completions.create(
+        # Call the LLM to generate the summary
+        response = _llm_client.chat.completions.create(
             model=model_choice,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
