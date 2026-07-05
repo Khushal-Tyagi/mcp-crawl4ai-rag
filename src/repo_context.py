@@ -87,7 +87,25 @@ SOURCE_EXTENSIONS: Dict[str, str] = {
     ".xml": "xml",
     ".pdf": "pdf",
     ".docx": "docx",
+    # Image files (standalone — processed via OCR / vision LLM)
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".tiff": "image",
+    ".tif": "image",
+    ".bmp": "image",
+    ".gif": "image",
+    ".webp": "image",
 }
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
+
+# Image processing feature flags (read once at import time)
+USE_IMAGE_OCR    = os.getenv("USE_IMAGE_OCR",    "false").lower() == "true"
+USE_IMAGE_VISION = os.getenv("USE_IMAGE_VISION", "false").lower() == "true"
+VISION_MODEL     = os.getenv("VISION_MODEL",     "llava")
+# If OCR finds fewer than this many characters, also run vision LLM
+IMAGE_OCR_MIN_CHARS = int(os.getenv("IMAGE_OCR_MIN_CHARS", "50"))
 
 EXCLUDE_DIRS = {
     ".git", "__pycache__", "node_modules", "venv", ".venv", "env",
@@ -205,50 +223,210 @@ def _get_default_branch(repo_path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Indexing
 
+def _describe_image_ocr(img_path: Path) -> str:
+    """Extract text from an image file using Tesseract OCR."""
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(str(img_path))
+        return pytesseract.image_to_string(img).strip()
+    except ImportError:
+        print("[repo_context] pytesseract/Pillow not installed — OCR skipped. "
+              "Add pytesseract and Pillow to pyproject.toml and rebuild.")
+        return ""
+    except Exception as e:
+        print(f"[repo_context] OCR failed for {img_path}: {e}")
+        return ""
+
+
+def _describe_image_vision(img_path: Path) -> str:
+    """Describe an image using an Ollama vision model (e.g. llava)."""
+    try:
+        import base64
+        import requests as _req
+        ollama_url = os.getenv("EMBEDDING_BASE_URL", "http://localhost:11434/v1")
+        base_url = ollama_url.rstrip("/").removesuffix("/v1")
+        with open(str(img_path), "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        resp = _req.post(
+            f"{base_url}/api/generate",
+            json={
+                "model": VISION_MODEL,
+                "prompt": (
+                    "Describe this image in full detail. "
+                    "If it is a block diagram or architecture drawing, list every component, "
+                    "label, connection, bus width, and numeric value shown. "
+                    "If it contains a register map, table, or memory map, transcribe every "
+                    "row and column accurately. "
+                    "If it is a terminal, log, or code screenshot, transcribe the exact text."
+                ),
+                "images": [img_b64],
+                "stream": False,
+            },
+            timeout=180,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    except Exception as e:
+        print(f"[repo_context] Vision LLM ({VISION_MODEL}) failed for {img_path}: {e}")
+        return ""
+
+
+def _process_image(img_path: Path) -> str:
+    """
+    Run OCR and/or vision LLM on a single image file according to env flags.
+    Returns combined text description, or empty string if both are disabled.
+    """
+    if not USE_IMAGE_OCR and not USE_IMAGE_VISION:
+        return ""
+
+    parts: list[str] = []
+
+    ocr_text = _describe_image_ocr(img_path) if USE_IMAGE_OCR else ""
+    if ocr_text:
+        parts.append(f"[OCR text]\n{ocr_text}")
+
+    # Run vision if explicitly enabled OR if OCR found too little text
+    run_vision = USE_IMAGE_VISION or (USE_IMAGE_OCR and len(ocr_text) < IMAGE_OCR_MIN_CHARS)
+    if run_vision:
+        vision_text = _describe_image_vision(img_path)
+        if vision_text:
+            parts.append(f"[Vision description]\n{vision_text}")
+
+    return "\n\n".join(parts)
+
+
+def _process_pdf_images(fpath: Path) -> str:
+    """Extract and process every image embedded in a PDF. Returns combined text."""
+    if not USE_IMAGE_OCR and not USE_IMAGE_VISION:
+        return ""
+    try:
+        import fitz
+        import tempfile
+        doc = fitz.open(str(fpath))
+        tmp_dir = Path(tempfile.mkdtemp(prefix="pdf-imgs-"))
+        all_texts: list[str] = []
+        try:
+            for page_num, page in enumerate(doc):
+                for img_idx, img_ref in enumerate(page.get_images(full=True)):
+                    xref = img_ref[0]
+                    try:
+                        img_data = doc.extract_image(xref)
+                        ext = img_data.get("ext", "png")
+                        img_path = tmp_dir / f"page{page_num}_img{img_idx}.{ext}"
+                        img_path.write_bytes(img_data["image"])
+                        text = _process_image(img_path)
+                        if text:
+                            all_texts.append(f"[Image from page {page_num + 1}]\n{text}")
+                    except Exception:
+                        continue
+        finally:
+            doc.close()
+            import shutil as _sh
+            _sh.rmtree(tmp_dir, ignore_errors=True)
+        return "\n\n".join(all_texts)
+    except Exception as e:
+        print(f"[repo_context] PDF image extraction failed for {fpath}: {e}")
+        return ""
+
+
+def _process_docx_images(fpath: Path) -> str:
+    """Extract and process every image embedded in a DOCX file. Returns combined text."""
+    if not USE_IMAGE_OCR and not USE_IMAGE_VISION:
+        return ""
+    try:
+        import zipfile
+        import tempfile
+        tmp_dir = Path(tempfile.mkdtemp(prefix="docx-imgs-"))
+        all_texts: list[str] = []
+        try:
+            with zipfile.ZipFile(str(fpath), "r") as z:
+                media_files = [
+                    n for n in z.namelist()
+                    if n.startswith("word/media/") and not n.endswith("/")
+                    and Path(n).suffix.lower() in IMAGE_EXTENSIONS
+                ]
+                for name in media_files:
+                    img_path = tmp_dir / Path(name).name
+                    img_path.write_bytes(z.read(name))
+                    text = _process_image(img_path)
+                    if text:
+                        all_texts.append(f"[Embedded image: {Path(name).name}]\n{text}")
+        finally:
+            import shutil as _sh
+            _sh.rmtree(tmp_dir, ignore_errors=True)
+        return "\n\n".join(all_texts)
+    except Exception as e:
+        print(f"[repo_context] DOCX image extraction failed for {fpath}: {e}")
+        return ""
+
+
 def _read_file_text(fpath: Path) -> str:
-    """Read text from a file, using PDF extraction for .pdf and docx extraction for .docx files."""
+    """Read text from a file.
+
+    Dispatch:
+    - Image files (.png/.jpg/...): OCR and/or vision LLM
+    - PDF: text layer extraction + embedded-image processing
+    - DOCX: paragraph/table text + embedded-image processing
+    - Everything else: plain UTF-8 read
+    """
     suffix = fpath.suffix.lower()
+
+    # ── Standalone image ──────────────────────────────────────────────────
+    if suffix in IMAGE_EXTENSIONS:
+        return _process_image(fpath)
+
+    # ── PDF ───────────────────────────────────────────────────────────────
     if suffix == ".pdf":
+        text = ""
         try:
             import fitz  # pymupdf
             doc = fitz.open(str(fpath))
             text = "\n".join(page.get_text() for page in doc)
             doc.close()
-            return text
         except Exception as e:
-            print(f"[repo_context] PDF extraction failed for {fpath}: {e}")
-            return ""
+            print(f"[repo_context] PDF text extraction failed for {fpath}: {e}")
+        img_text = _process_pdf_images(fpath)
+        if img_text:
+            text = text + ("\n\n" if text else "") + img_text
+        return text
+
+    # ── DOCX ──────────────────────────────────────────────────────────────
     if suffix == ".docx":
+        text = ""
         try:
             from docx import Document
+            from docx.oxml.ns import qn
             doc = Document(str(fpath))
             parts = []
             for block in doc.element.body:
                 tag = block.tag.split("}")[-1]
                 if tag == "p":
-                    # paragraph
-                    from docx.oxml.ns import qn
-                    text = "".join(node.text or "" for node in block.iter() if node.tag in (
-                        qn("w:t"), qn("w:delText")
-                    ))
-                    if text.strip():
-                        parts.append(text)
+                    t = "".join(
+                        node.text or "" for node in block.iter()
+                        if node.tag in (qn("w:t"), qn("w:delText"))
+                    )
+                    if t.strip():
+                        parts.append(t)
                 elif tag == "tbl":
-                    # table — extract row by row
-                    from docx.oxml.ns import qn
                     for row in block.findall(f".//{qn('w:tr')}"):
                         cells = []
                         for cell in row.findall(f".//{qn('w:tc')}"):
-                            cell_text = "".join(
+                            ct = "".join(
                                 node.text or "" for node in cell.iter()
                                 if node.tag in (qn("w:t"), qn("w:delText"))
                             )
-                            cells.append(cell_text.strip())
+                            cells.append(ct.strip())
                         parts.append("\t".join(cells))
-            return "\n".join(parts)
+            text = "\n".join(parts)
         except Exception as e:
-            print(f"[repo_context] DOCX extraction failed for {fpath}: {e}")
-            return ""
+            print(f"[repo_context] DOCX text extraction failed for {fpath}: {e}")
+        img_text = _process_docx_images(fpath)
+        if img_text:
+            text = text + ("\n\n" if text else "") + img_text
+        return text
+
+    # ── Plain text / source code ──────────────────────────────────────────
     return fpath.read_text(encoding="utf-8", errors="ignore")
 
 

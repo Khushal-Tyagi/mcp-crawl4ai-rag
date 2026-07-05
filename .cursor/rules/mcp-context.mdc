@@ -80,3 +80,41 @@ from common_utils import some_helper
 import common_utils
 ```
 → search `repo_name="applications.validation.fpga.solutions.utilities.utilities"` for `some_helper` or relevant symbol
+
+---
+
+## C/C++ Header → Indexed Repo Mapping
+
+When you see a `#include "header.h"` directive, map it to the correct indexed repo using this table.
+Always pass `repo_name` when searching to avoid noise from other repos.
+
+| Header / header path pattern | Indexed repo name |
+|---|---|
+| `abc.h` / `abc/*.h` | `<fill-in-repo-name>` |
+| `pqr.h` / `pqr/*.h` | `<fill-in-repo-name>` |
+| `hal/*.h` | `<fill-in-hal-repo-name>` |
+| `platform/*.h` | `<fill-in-platform-repo-name>` |
+
+> **Replace the placeholders above** with your actual header names and indexed repo names.
+> Run `list_indexed_repositories` to see all available repo names.
+
+### When to use resolve_include_chain
+Before writing C/C++ code that touches headers from multiple repos, call:
+```
+resolve_include_chain(repo_name="<source-repo>", file_path="src/file.c", max_depth=5)
+```
+This returns every header pulled in transitively across all repos — use it to understand types, macros, and APIs before generating code.
+
+### C/C++ usage rule
+When the user asks to write or modify C/C++ code that includes headers:
+1. Check the mapping table above to identify which repos the headers belong to
+2. Use `search_repository_code(query="...", repo_name="<mapped-repo>")` scoped to that repo
+3. For complex files with many includes, call `resolve_include_chain` first to map the full dependency tree
+4. Use `get_repository_file(repo_name="...", path="include/header.h")` to read the exact header content before generating code that uses its types/macros
+
+### Example
+```c
+#include "hal/clk.h"       // → search repo_name="<fill-in-hal-repo-name>"
+#include "platform/regs.h" // → search repo_name="<fill-in-platform-repo-name>"
+```
+→ call `resolve_include_chain` on the file first, then scope all searches to the mapped repos

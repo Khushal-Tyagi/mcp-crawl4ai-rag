@@ -2,7 +2,7 @@
 
 An MCP (Model Context Protocol) server that provides Cursor and other AI coding assistants with semantic search over your private codebases, local files, hardware specs, and documentation. Built on [Crawl4AI](https://crawl4ai.com) for web content and custom indexing pipelines for code and file sources.
 
-Embeddings run locally via **Ollama** — no data leaves your network.
+Embeddings run locally via **Ollama** ï¿½ no data leaves your network.
 
 ---
 
@@ -13,11 +13,12 @@ Embeddings run locally via **Ollama** — no data leaves your network.
 - **Remote file indexing**: SCP files from other machines and index them
 - **Web crawling**: Crawl public documentation sites and store them as searchable content
 - **Cursor machine upload**: Upload files from your Windows/Linux laptop to the server for indexing
-- **PDF and DOCX support**: Index hardware datasheets and Word documents
+- **PDF and DOCX support**: Index hardware datasheets and Word documents (including embedded images inside them)
+- **Image support**: Index standalone images and images embedded in PDFs/DOCX â€” OCR for text/tables/screenshots, vision LLM (llava) for block diagrams
 - **Hardware file support**: `.rdl`, `.ralf`, `.csv`, `.xml`, and all standard source file types
 - **No file size limit**: Configurable via `MAX_FILE_BYTES` (default: unlimited)
 - **Incremental indexing**: `skip_existing` flag to only index new files
-- **Local embeddings**: Ollama `mxbai-embed-large` (1024 dimensions) — no OpenAI key needed
+- **Local embeddings**: Ollama `mxbai-embed-large` (1024 dimensions) ï¿½ no OpenAI key needed
 - **Self-hosted database**: Works with self-hosted Supabase (Docker Compose)
 - **Persistent Docker deployment**: Runs as a container on a Linux server, accessed via SSH tunnel from Cursor
 
@@ -62,6 +63,7 @@ Cursor (Windows) --SSH tunnel--> Linux Server
 | `get_repository_file` | Retrieve a previously indexed file by repo + path |
 | `gather_task_context` | Unified context bundle: snippets + symbols for a task description |
 | `find_symbol_across_repos` | Find class/method/function by name across all repos (requires `USE_KNOWLEDGE_GRAPH=true`) |
+| `resolve_include_chain` | Trace transitive `#include` dependencies of a C/C++ file across all indexed repos |
 
 ### Knowledge Graph (Optional)
 | Tool | Description |
@@ -78,6 +80,7 @@ Cursor (Windows) --SSH tunnel--> Linux Server
 
 - Linux server with Docker installed
 - [Ollama](https://ollama.com/) running on the server with `mxbai-embed-large` pulled
+- For image support: pull `llava` model â€” `ollama pull llava`
 - Self-hosted Supabase (Docker Compose) or a cloud Supabase project
 
 ### 1. Clone the repository on the server
@@ -145,6 +148,12 @@ SERVER_SSH_HOST=<server IP>
 SERVER_SSH_USER=<your-username>
 SERVER_SSH_PORT=22
 SERVER_SSH_PASSWORD=<password>   # or use SERVER_SSH_KEY=/path/to/key
+
+# Image processing (requires rebuild for OCR)
+USE_IMAGE_OCR=true             # OCR via Tesseract â€” best for text/tables/screenshots
+USE_IMAGE_VISION=true          # llava vision LLM â€” best for block diagrams
+VISION_MODEL=llava
+IMAGE_OCR_MIN_CHARS=50         # if OCR finds fewer chars than this, also run vision
 ```
 
 ### 4. Build the Docker image
@@ -224,7 +233,7 @@ index_local_path(local_path="/home/user/specs/chip_registers", source_name="vsip
 
 ```
 prepare_cursor_machine_upload(source_name="my-specs")
-# Returns an scp command — run it in your local terminal, then:
+# Returns an scp command ï¿½ run it in your local terminal, then:
 index_local_path(local_path="<returned staging_path>", source_name="my-specs")
 ```
 
@@ -242,7 +251,7 @@ index_remote_path(
 )
 ```
 
-Next time, just use `system_name="dev-server"` — credentials are saved in `remote_systems.json`.
+Next time, just use `system_name="dev-server"` ï¿½ credentials are saved in `remote_systems.json`.
 
 ### Crawl a documentation website
 
@@ -262,6 +271,7 @@ smart_crawl_url("https://docs.example.com/sitemap.xml")
 | Web | `.js`, `.ts`, `.jsx`, `.tsx`, `.html`, `.css` |
 | Data | `.csv`, `.tsv`, `.txt`, `.xml`, `.json`, `.yaml`, `.yml` |
 | Docs | `.md`, `.rst`, `.pdf`, `.docx` |
+| Images | `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp`, `.gif`, `.webp` |
 | Other | `.java`, `.rs`, `.go`, `.rb`, `.sh`, `.sv`, `.v`, `.vhd` |
 
 ---
@@ -271,10 +281,10 @@ smart_crawl_url("https://docs.example.com/sitemap.xml")
 Since `src/` is volume-mounted:
 
 ```bash
-# On Windows — copy updated file to server
+# On Windows ï¿½ copy updated file to server
 scp src\altera_rag.py user@SERVER:/path/to/RAG_MCP/src/altera_rag.py
 
-# On server — restart the container
+# On server ï¿½ restart the container
 docker restart altera-rag
 ```
 
@@ -304,6 +314,49 @@ All strategies default to `false`. Enable in `.env`:
 | `USE_AGENTIC_RAG` | Extract and store code blocks separately. Enables `search_code_examples`. |
 | `USE_RERANKING` | Re-rank search results with a cross-encoder. Better result ordering, no extra API cost. |
 | `USE_KNOWLEDGE_GRAPH` | Enable Neo4j-based structural analysis and hallucination detection. Requires Neo4j. |
+
+## Image Processing Options
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_IMAGE_OCR` | `false` | Tesseract OCR for images. Best for text, tables, terminal screenshots, scanned docs. Requires rebuild. |
+| `USE_IMAGE_VISION` | `false` | llava vision LLM for images. Best for block diagrams and architecture drawings. |
+| `VISION_MODEL` | `llava` | Ollama vision model to use. |
+| `IMAGE_OCR_MIN_CHARS` | `50` | If OCR returns fewer chars than this, also run vision LLM as fallback. |
+
+Image processing is applied to:
+- Standalone image files (`.png`, `.jpg`, etc.)
+- Images embedded inside `.pdf` files
+- Images embedded inside `.docx` files
+
+## Ollama Load Settings
+
+Start Ollama with settings tuned for your server before running the container:
+
+```bash
+# Stop existing Ollama instance
+sudo systemctl stop ollama 2>/dev/null || sudo lsof -ti:11434 | xargs sudo kill -9
+sleep 2
+
+# Start with parallel processing enabled
+# Tune OLLAMA_NUM_THREAD to ~70% of your cores
+OLLAMA_NUM_PARALLEL=36 \
+OLLAMA_NUM_THREAD=80 \
+OLLAMA_MAX_LOADED_MODELS=2 \
+ollama serve &
+```
+
+| Setting | Recommended (112-core server) | Description |
+|---------|-------------------------------|-------------|
+| `OLLAMA_NUM_PARALLEL` | `36` | Concurrent requests (embedding + vision combined) |
+| `OLLAMA_NUM_THREAD` | `80` | CPU threads (~70% of cores, leaves headroom for OS) |
+| `OLLAMA_MAX_LOADED_MODELS` | `2` | Keep `mxbai-embed-large` + `llava` both hot in memory |
+
+Verify Ollama is running:
+```bash
+ss -tlnp | grep 11434
+curl -s http://localhost:11434/api/version
+```
 
 ---
 
@@ -342,4 +395,4 @@ Save SSH credentials for remote machines in `remote_systems.json`:
 }
 ```
 
-Use either `ssh_key` (path to key on the server) or `password` — not both.
+Use either `ssh_key` (path to key on the server) or `password` ï¿½ not both.

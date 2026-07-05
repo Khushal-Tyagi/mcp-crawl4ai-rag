@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     openssh-client \
     sshpass \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

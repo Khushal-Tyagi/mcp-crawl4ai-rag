@@ -80,12 +80,31 @@ docker exec -it supabase-db psql -U postgres -d postgres -c \
 # Pull required models
 ollama pull mxbai-embed-large   # embeddings (required)
 ollama pull llama3.2            # LLM for summaries (only needed if USE_CONTEXTUAL_EMBEDDINGS=true)
+ollama pull llava               # vision LLM for image indexing (only needed if USE_IMAGE_VISION=true)
 
-# Start Ollama with parallel processing (tune for your server)
-OLLAMA_NUM_PARALLEL=32 OLLAMA_NUM_THREAD=64 ollama serve &
+# Stop any existing Ollama instance first
+sudo systemctl stop ollama 2>/dev/null || sudo lsof -ti:11434 | xargs sudo kill -9 2>/dev/null
+sleep 2
+
+# Start Ollama with parallel processing tuned for 112-core server
+OLLAMA_NUM_PARALLEL=36 \
+OLLAMA_NUM_THREAD=80 \
+OLLAMA_MAX_LOADED_MODELS=2 \
+ollama serve &
 ```
 
-> On a 112-core server, `OLLAMA_NUM_PARALLEL=32` and `OLLAMA_NUM_THREAD=64` gives good throughput.
+| Setting | Value | Rationale |
+|---------|-------|----------|
+| `OLLAMA_NUM_PARALLEL` | 36 | Handles 32 embedding + 4 vision requests concurrently |
+| `OLLAMA_NUM_THREAD` | 80 | ~70% of 112 cores — leaves headroom for OS and Docker |
+| `OLLAMA_MAX_LOADED_MODELS` | 2 | Keeps both `mxbai-embed-large` and `llava` hot in memory |
+
+Verify Ollama started:
+```bash
+jobs                              # check background process is Running
+ss -tlnp | grep 11434             # port should be LISTEN
+curl -s http://localhost:11434/api/version
+```
 
 ---
 
@@ -130,6 +149,12 @@ SERVER_SSH_HOST=<this server's IP or hostname>
 SERVER_SSH_USER=bapvesm013t
 SERVER_SSH_PORT=22
 SERVER_SSH_KEY=   # leave blank if using password/agent auth
+
+# Image processing
+USE_IMAGE_OCR=true             # Tesseract OCR (text, tables, screenshots)
+USE_IMAGE_VISION=true          # llava vision LLM (block diagrams, architecture drawings)
+VISION_MODEL=llava
+IMAGE_OCR_MIN_CHARS=50         # fallback to vision if OCR finds fewer chars than this
 ```
 
 ---
@@ -304,6 +329,12 @@ Call perform_rag_query:
 
 Call gather_task_context:
   task: "implement OAuth login"
+
+Call resolve_include_chain:
+  repo_name: "chip-a-drivers"
+  file_path: "src/clk.c"
+  max_depth: 5
+  # Returns the full transitive #include tree across all indexed repos
 ```
 
 ---
@@ -358,8 +389,18 @@ docker logs --tail 50 altera-rag
 ### Restart Ollama
 
 ```bash
-pkill ollama
-OLLAMA_NUM_PARALLEL=32 OLLAMA_NUM_THREAD=64 ollama serve &
+# Stop cleanly
+sudo systemctl stop ollama 2>/dev/null || sudo lsof -ti:11434 | xargs sudo kill -9
+sleep 2
+
+# Restart with load settings
+OLLAMA_NUM_PARALLEL=36 \
+OLLAMA_NUM_THREAD=80 \
+OLLAMA_MAX_LOADED_MODELS=2 \
+ollama serve &
+
+# Verify
+ss -tlnp | grep 11434
 ```
 
 ---
@@ -373,6 +414,10 @@ OLLAMA_NUM_PARALLEL=32 OLLAMA_NUM_THREAD=64 ollama serve &
 | `USE_AGENTIC_RAG` | false | Extracts code examples into a separate table for code-specific queries. |
 | `USE_RERANKING` | false | Re-ranks results using a cross-encoder model after retrieval. |
 | `USE_KNOWLEDGE_GRAPH` | false | Builds a Neo4j structural graph (File/Class/Method nodes). Requires a running Neo4j instance. |
+| `USE_IMAGE_OCR` | false | Tesseract OCR for images and embedded images in PDF/DOCX. Requires rebuild (tesseract-ocr in Dockerfile). |
+| `USE_IMAGE_VISION` | false | llava vision LLM for diagrams and images. Requires `ollama pull llava`. No rebuild needed. |
+| `VISION_MODEL` | llava | Ollama vision model name. |
+| `IMAGE_OCR_MIN_CHARS` | 50 | If OCR finds fewer chars than this, also run vision LLM as fallback. |
 
 > All false is the recommended starting point — basic RAG works well without any of them.
 
@@ -389,4 +434,7 @@ OLLAMA_NUM_PARALLEL=32 OLLAMA_NUM_THREAD=64 ollama serve &
 | Cursor can't connect | Check SSH tunnel is active; verify endpoint is `/mcp` not `/sse` |
 | `description` kwarg error on FastMCP | Already removed in current `altera_rag.py` |
 | Container exits immediately | Run `docker logs altera-rag` to see error |
-| Ollama slow | Ensure `OLLAMA_NUM_PARALLEL` and `OLLAMA_NUM_THREAD` are set before `ollama serve` |
+| Ollama port already in use | `sudo systemctl stop ollama` or `sudo lsof -ti:11434 \| xargs sudo kill -9` |
+| llava not found | `ollama pull llava` on the server |
+| OCR returns empty text | Install `tesseract-ocr` in Dockerfile (requires rebuild); verify with `docker exec altera-rag tesseract --version` |
+| Image indexing slow | Set `USE_IMAGE_VISION=false` to use OCR only, or process images in smaller batches |
