@@ -2,7 +2,7 @@
 
 An MCP (Model Context Protocol) server that provides Cursor and other AI coding assistants with semantic search over your private codebases, local files, hardware specs, and documentation. Built on [Crawl4AI](https://crawl4ai.com) for web content and custom indexing pipelines for code and file sources.
 
-Embeddings run locally via **Ollama** � no data leaves your network.
+Embeddings run locally via **Ollama** - no data leaves your network.
 
 ---
 
@@ -18,7 +18,7 @@ Embeddings run locally via **Ollama** � no data leaves your network.
 - **Hardware file support**: `.rdl`, `.ralf`, `.csv`, `.xml`, and all standard source file types
 - **No file size limit**: Configurable via `MAX_FILE_BYTES` (default: unlimited)
 - **Incremental indexing**: `skip_existing` flag to only index new files
-- **Local embeddings**: Ollama `mxbai-embed-large` (1024 dimensions) � no OpenAI key needed
+- **Local embeddings**: Ollama `mxbai-embed-large` (1024 dimensions) - no OpenAI key needed
 - **Self-hosted database**: Works with self-hosted Supabase (Docker Compose)
 - **Persistent Docker deployment**: Runs as a container on a Linux server, accessed via SSH tunnel from Cursor
 
@@ -61,7 +61,7 @@ Cursor (Windows) --SSH tunnel--> Linux Server
 | `search_repository_code` | Semantic search over indexed source files |
 | `search_code_examples` | Search extracted code blocks (requires `USE_AGENTIC_RAG=true`) |
 | `get_repository_file` | Retrieve a previously indexed file by repo + path |
-| `gather_task_context` | Unified context bundle: snippets + symbols for a task description |
+| `gather_task_context` | Unified context bundle for a task: semantic snippets + symbol matches |
 | `find_symbol_across_repos` | Find class/method/function by name across all repos (requires `USE_KNOWLEDGE_GRAPH=true`) |
 | `resolve_include_chain` | Trace transitive `#include` dependencies of a C/C++ file across all indexed repos |
 
@@ -70,7 +70,13 @@ Cursor (Windows) --SSH tunnel--> Linux Server
 |------|-------------|
 | `parse_github_repository` | Parse a repo into Neo4j for structural analysis |
 | `check_ai_script_hallucinations` | Validate AI-generated code against the knowledge graph |
-| `query_knowledge_graph` | Query Neo4j directly |
+| `query_knowledge_graph` | Command-based Neo4j explorer (`repos`, `explore`, `classes`, `class`, `method`, `query`) |
+
+Tool count in current server implementation: **19 MCP tools**.
+
+Tool gating flags:
+- `USE_AGENTIC_RAG=true` is required for `search_code_examples`.
+- `USE_KNOWLEDGE_GRAPH=true` is required for `parse_github_repository`, `check_ai_script_hallucinations`, `query_knowledge_graph`, and `find_symbol_across_repos`.
 
 ---
 
@@ -221,6 +227,12 @@ ssh -L 8051:localhost:8051 <user>@<SERVER_IP>
 index_repository_source("https://github.com/my-org/my-repo.git")
 ```
 
+To refresh an already indexed repository by name:
+
+```
+update_repository(repo_name="my-repo")
+```
+
 For private repos, ensure `.netrc` or SSH keys are mounted into the container (see step 5 above).
 
 ### Index local files on the server
@@ -233,7 +245,8 @@ index_local_path(local_path="/home/user/specs/chip_registers", source_name="vsip
 
 ```
 prepare_cursor_machine_upload(source_name="my-specs")
-# Returns an scp command � run it in your local terminal, then:
+# Returns an scp command - run it in your local terminal, then:
+# Returns an scp command - run it in your local terminal, then:
 index_local_path(local_path="<returned staging_path>", source_name="my-specs")
 ```
 
@@ -251,12 +264,20 @@ index_remote_path(
 )
 ```
 
-Next time, just use `system_name="dev-server"` � credentials are saved in `remote_systems.json`.
+Next time, just use `system_name="dev-server"` - credentials are saved in `remote_systems.json`.
 
 ### Crawl a documentation website
 
 ```
 smart_crawl_url("https://docs.example.com/sitemap.xml")
+```
+
+### Explore the knowledge graph
+
+```
+query_knowledge_graph("repos")
+query_knowledge_graph("explore my-repo")
+query_knowledge_graph("classes my-repo")
 ```
 
 ---
@@ -281,10 +302,10 @@ smart_crawl_url("https://docs.example.com/sitemap.xml")
 Since `src/` is volume-mounted:
 
 ```bash
-# On Windows � copy updated file to server
+# On Windows - copy updated file to server
 scp src\altera_rag.py user@SERVER:/path/to/RAG_MCP/src/altera_rag.py
 
-# On server � restart the container
+# On server - restart the container
 docker restart altera-rag
 ```
 
@@ -395,4 +416,4 @@ Save SSH credentials for remote machines in `remote_systems.json`:
 }
 ```
 
-Use either `ssh_key` (path to key on the server) or `password` � not both.
+Use either `ssh_key` (path to key on the server) or `password` - not both.
